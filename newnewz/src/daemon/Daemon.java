@@ -11,6 +11,7 @@ import java.util.*;
 public class Daemon {
 
     static String SHARED_DIR;
+    static String DOWNLOAD_DIR; 
 
     public static void main(String[] args) throws Exception {
 
@@ -22,11 +23,18 @@ public class Daemon {
         int port = Integer.parseInt(args[0]);
 
         SHARED_DIR = "shared_" + port;
+        DOWNLOAD_DIR = "downloads_" + port;
 
-        File folder = new File(SHARED_DIR);
-        if (!folder.exists()) {
-            folder.mkdir();
+        File sharedFolder = new File(SHARED_DIR);
+        if (!sharedFolder.exists()) {
+            sharedFolder.mkdir();
             System.out.println(" Created shared folder: " + SHARED_DIR);
+        }
+
+        File downloadFolder = new File(DOWNLOAD_DIR);
+        if (!downloadFolder.exists()) {
+            downloadFolder.mkdir();
+            System.out.println(" Created download folder: " + DOWNLOAD_DIR);
         }
 
         DirectoryInterface directory =
@@ -35,7 +43,7 @@ public class Daemon {
         ClientInfo client = new ClientInfo("127.0.0.1", port);
 
         List<String> files = new ArrayList<>();
-        File[] fileList = folder.listFiles();
+        File[] fileList = sharedFolder.listFiles();
         if (fileList != null) {
             for (File f : fileList) {
                 if (f.isFile()) files.add(f.getName());
@@ -44,7 +52,7 @@ public class Daemon {
 
         directory.register(client, files);
 
-        System.out.println(" Shared files in this Daemon (" + SHARED_DIR + "):");
+        System.out.println(" Shared files (" + SHARED_DIR + "):");
         if (files.isEmpty()) {
             System.out.println("   (no files yet - put files into folder to share)");
         } else {
@@ -55,7 +63,7 @@ public class Daemon {
         startHeartbeat(directory, client);
         new Thread(() -> startFileServer(port)).start();
 
-        System.out.println(" Daemon ready! Type filename to download (or 'exit' to quit)\n");
+        System.out.println(" Daemon ready on port " + port + " | Downloads go to: " + DOWNLOAD_DIR + "\n");
 
         Scanner sc = new Scanner(System.in);
         while (true) {
@@ -64,13 +72,13 @@ public class Daemon {
 
             if (input.equalsIgnoreCase("exit") || input.equalsIgnoreCase("quit")) {
                 directory.unregister(client);
-                System.out.println(" Daemon shutting down...");
+                System.out.println(" Shutting down...");
                 System.exit(0);
             }
 
             if (!input.isEmpty()) {
                 try {
-                    DownloadManager.download(input, directory, port);
+                    DownloadManager.download(input, directory, port, DOWNLOAD_DIR);
                 } catch (Exception e) {
                     System.err.println(" Download failed: " + e.getMessage());
                 }
@@ -85,7 +93,7 @@ public class Daemon {
                     Thread.sleep(5000);
                     directory.heartbeat(client);
                 } catch (Exception e) {
-                    System.err.println(" Heartbeat failed");
+                    System.err.println("Heartbeat failed: " + e.getMessage());
                     break;
                 }
             }
@@ -99,7 +107,7 @@ public class Daemon {
                 new Thread(new FileServer(server.accept())).start();
             }
         } catch (Exception e) {
-            System.err.println(" FileServer error: " + e.getMessage());
+            System.err.println("FileServer error: " + e.getMessage());
         }
     }
 }

@@ -21,42 +21,42 @@ public class DownloadManager {
 
     public static void download(String filename,
                                 DirectoryInterface directory,
-                                int myPort)
-            throws Exception {
+                                int myPort,
+                                String downloadDir) throws Exception {
 
         long startTime = System.currentTimeMillis();
 
-        String partFilePath = "downloads/" + filename + ".part";
-        String finalFilePath = "downloads/" + filename;
+        String partFilePath  = downloadDir + "/" + filename + ".part";
+        String finalFilePath = downloadDir + "/" + filename;
 
-        File partFile = new File(partFilePath);
+        File partFile  = new File(partFilePath);
         File finalFile = new File(finalFilePath);
 
         if (finalFile.exists()) {
-            System.out.println(" File already completed: " + filename);
+            System.out.println(" File already completed: " + finalFilePath);
             return;
         }
 
         long alreadyDownloaded = partFile.exists() ? partFile.length() : 0;
-
         if (alreadyDownloaded > 0) {
-            System.out.println(" RESUMING from " + alreadyDownloaded + " / " + fileSize + " bytes");
+            System.out.println(" RESUMING from " + alreadyDownloaded + " bytes in " + downloadDir);
         } else {
-            new File("downloads").mkdirs();
+            new File(downloadDir).mkdirs();
         }
 
         List<ClientInfo> sources = directory.getSourcesSortedByLoad(filename);
         sources.removeIf(c -> c.getPort() == myPort);
 
         if (sources.isEmpty()) {
-            System.out.println("No source found");
+            System.out.println(" No source found for: " + filename);
             return;
         }
 
-        System.out.println("Initial sources: " + sources.size());
+        System.out.println("Found " + sources.size() + " sources:");
         sources.forEach(c -> System.out.println("  → " + c));
 
         currentSources = new CopyOnWriteArrayList<>(sources);
+
         ScheduledExecutorService refresher = Executors.newSingleThreadScheduledExecutor();
         refresher.scheduleAtFixedRate(() -> refreshSources(directory, filename, myPort),
                 5, 5, TimeUnit.SECONDS);
@@ -70,11 +70,13 @@ public class DownloadManager {
             out.writeUTF(filename);
             fileSize = in.readLong();
         }
-        System.out.println("File size: " + fileSize + " bytes");
+        System.out.println(" File size: " + fileSize + " bytes");
 
         if (alreadyDownloaded >= fileSize) {
-            partFile.renameTo(finalFile);
-            System.out.println(" File was already complete (renamed)");
+            if (partFile.renameTo(finalFile)) {
+                System.out.println(" File was already complete (renamed)");
+            }
+            refresher.shutdownNow();
             return;
         }
 
@@ -100,7 +102,7 @@ public class DownloadManager {
                 while (!pool.isTerminated()) {
                     long done = totalDownloaded.get();
                     int percent = (int) (done * 100 / fileSize);
-                    System.out.printf("\r[Progress] %3d%% | %8d / %8d bytes | Sources: %d ",
+                    System.out.printf("\r[Progress] %3d%% | %10d / %10d bytes | Sources: %2d ",
                             percent, done, fileSize, currentSources.size());
                     Thread.sleep(600);
                 }
@@ -124,9 +126,9 @@ public class DownloadManager {
         System.out.println("   Time: " + (endTime - startTime) + " ms");
 
         if (partFile.renameTo(finalFile)) {
-            System.out.println(" Saved as: " + finalFilePath);
+            System.out.println(" Saved to: " + finalFilePath);
         } else {
-            System.out.println(" Cannot rename .part file");
+            System.out.println(" Cannot rename .part file to final file");
         }
     }
 
