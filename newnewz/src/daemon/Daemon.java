@@ -43,12 +43,19 @@ public class Daemon {
         }
 
         directory.register(client, files);
+
+        System.out.println(" Shared files in this Daemon (" + SHARED_DIR + "):");
+        if (files.isEmpty()) {
+            System.out.println("   (no files yet - put files into folder to share)");
+        } else {
+            files.forEach(f -> System.out.println("   • " + f));
+        }
         System.out.println(" Daemon registered with " + files.size() + " files");
 
         startHeartbeat(directory, client);
         new Thread(() -> startFileServer(port)).start();
 
-        System.out.println(" Daemon ready! Type filename to download (or 'exit' to quit)");
+        System.out.println(" Daemon ready! Type filename to download (or 'exit' to quit)\n");
 
         Scanner sc = new Scanner(System.in);
         while (true) {
@@ -65,7 +72,7 @@ public class Daemon {
                 try {
                     DownloadManager.download(input, directory, port);
                 } catch (Exception e) {
-                    System.err.println("Download failed: " + e.getMessage());
+                    System.err.println(" Download failed: " + e.getMessage());
                 }
             }
         }
@@ -78,7 +85,7 @@ public class Daemon {
                     Thread.sleep(5000);
                     directory.heartbeat(client);
                 } catch (Exception e) {
-                    System.err.println(" Heartbeat failed, Directory may be down");
+                    System.err.println(" Heartbeat failed");
                     break;
                 }
             }
@@ -88,7 +95,6 @@ public class Daemon {
     static void startFileServer(int port) {
         try (ServerSocket server = new ServerSocket(port)) {
             System.out.println("🔌 FileServer listening on port " + port);
-
             while (true) {
                 new Thread(new FileServer(server.accept())).start();
             }
