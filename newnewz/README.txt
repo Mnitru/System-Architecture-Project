@@ -1,4 +1,4 @@
-# 🎵 SongSong Project - Parallel File Download Infrastructure
+# SongSong Project - Parallel File Download Infrastructure
 
 **Course:** System Architecture - USTH 2026  
 **Group:** 10
