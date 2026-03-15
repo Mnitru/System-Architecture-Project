@@ -54,7 +54,7 @@ downloads/            ← Downloaded files (auto-created)
 | **DownloadManager.java**    | daemon/        | Core of the system. Handles chunk division, parallel download, resume from `.part`, retry on failure, dynamic source refresh, progress bar, and MD5 check. |
 
 ## How to Run (Step-by-step Manual)
-
+**WINDOW
 ### 1. Compile
 ```bash
 cd src
@@ -70,3 +70,22 @@ java daemon.Daemon 5003
 type : abc.zip
 ###Alternative (direct download):
 java daemon.DownloadManager bigfile.zip
+
+**LINUX
+# 1. Compile
+cd src
+javac -d . directory/*.java model/*.java daemon/*.java
+
+# 2. Open multiple terminals (recommended way)
+gnome-terminal --tab -- bash -c "java directory.Directory; exec bash" &
+gnome-terminal --tab -- bash -c "java daemon.Daemon 5000; exec bash" &
+gnome-terminal --tab -- bash -c "java daemon.Daemon 5001; exec bash" &
+gnome-terminal --tab -- bash -c "java daemon.Daemon 5002; exec bash" &
+
+# 3. Start download in current terminal
+java daemon.Daemon 5003
+tmux new-session -d -s songsong "java directory.Directory"
+tmux split-window -h "java daemon.Daemon 5000"
+tmux split-window -v "java daemon.Daemon 5001"
+tmux split-window -v "java daemon.Daemon 5002"
+tmux attach -t songsong
