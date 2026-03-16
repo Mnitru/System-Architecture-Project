@@ -61,12 +61,12 @@ cd src
 javac -d . directory/*.java model/*.java daemon/*.java
 ###2. Start Directory Server (only one instance)
 java directory.Directory
-###3. Start Daemons (open multiple terminals)
-java daemon.Daemon 5000
-java daemon.Daemon 5001
-java daemon.Daemon 5002
+###3. Start Daemons (open multiple terminals)(0,3000,8000,10000 are speed(mb/s))
+java daemon.Daemon 5000 0
+java daemon.Daemon 5001 3000 
+java daemon.Daemon 5002 8000
 ###4. Download a file
-java daemon.Daemon 5003
+java daemon.Daemon 5003 10000
 type : abc.zip
 ###Alternative (direct download):
 java daemon.DownloadManager bigfile.zip
