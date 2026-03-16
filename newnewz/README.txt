@@ -50,18 +50,17 @@ downloads/            ← Downloaded files (auto-created)
 | **DirectoryInterface.java** | directory/     | RMI remote interface (register, unregister, getSourcesSortedByLoad, increment/decrement load, heartbeat). |
 | **Directory.java**          | directory/     | Main RMI server. Manages file index, load balancing, and automatic cleanup of dead clients. |
 | **Daemon.java**             | daemon/        | Runs on each client. Registers files, sends heartbeat, starts TCP server, and provides interactive download interface. |
-| **FileServer.java**         | daemon/        | Handles TCP requests ("SIZE" and "GET"). Supports GZIP compression. |
+| **FileServer.java**         | daemon/        | Handles TCP requests ("SIZE" and "GET"). Supports GZIP compression or not. |
 | **DownloadManager.java**    | daemon/        | Core of the system. Handles chunk division, parallel download, resume from `.part`, retry on failure, dynamic source refresh, progress bar, and MD5 check. |
 
 ## How to Run (Step-by-step Manual)
-**WINDOW
 ### 1. Compile
 ```bash
 cd src
 javac -d . directory/*.java model/*.java daemon/*.java
 ###2. Start Directory Server (only one instance)
 java directory.Directory
-###3. Start Daemons (open multiple terminals)(0,3000,8000,10000 are speed(kbps))
+###3. Start Daemons (open multiple terminals)(3000,8000,10000 are speed(kbps), 0 is unlimited speed)
 java daemon.Daemon 5000 0
 java daemon.Daemon 5001 3000 
 java daemon.Daemon 5002 8000
@@ -71,21 +70,5 @@ type : abc.zip
 ###Alternative (direct download):
 java daemon.DownloadManager bigfile.zip
 
-**LINUX
-# 1. Compile
-cd src
-javac -d . directory/*.java model/*.java daemon/*.java
 
-# 2. Open multiple terminals (recommended way)
-gnome-terminal --tab -- bash -c "java directory.Directory; exec bash" &
-gnome-terminal --tab -- bash -c "java daemon.Daemon 5000; exec bash" &
-gnome-terminal --tab -- bash -c "java daemon.Daemon 5001; exec bash" &
-gnome-terminal --tab -- bash -c "java daemon.Daemon 5002; exec bash" &
 
-# 3. Start download in current terminal
-java daemon.Daemon 5003
-tmux new-session -d -s songsong "java directory.Directory"
-tmux split-window -h "java daemon.Daemon 5000"
-tmux split-window -v "java daemon.Daemon 5001"
-tmux split-window -v "java daemon.Daemon 5002"
-tmux attach -t songsong

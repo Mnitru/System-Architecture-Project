@@ -92,7 +92,6 @@ public class Directory extends UnicastRemoteObject implements DirectoryInterface
 
         System.out.println(" Directory server ready on port 1099");
 
-        // Thread tự động cleanup dead clients
         new Thread(() -> {
             while (true) {
                 try {

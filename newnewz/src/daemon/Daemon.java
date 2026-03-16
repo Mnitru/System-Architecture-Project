@@ -81,7 +81,6 @@ public class Daemon {
         System.out.println(" Daemon ready on port " + port + 
                 " | Downloads will go to: " + DOWNLOAD_DIR + "\n");
 
-        // Interactive mode
         Scanner sc = new Scanner(System.in);
         while (true) {
             System.out.print(" download file: ");
