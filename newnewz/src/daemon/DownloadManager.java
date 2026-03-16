@@ -33,13 +33,13 @@ public class DownloadManager {
         File finalFile = new File(finalFilePath);
 
         if (finalFile.exists()) {
-            System.out.println(" File already completed: " + finalFilePath);
+            System.out.println("✅ File already completed");
             return;
         }
 
         long alreadyDownloaded = partFile.exists() ? partFile.length() : 0;
         if (alreadyDownloaded > 0) {
-            System.out.println(" RESUMING from " + alreadyDownloaded + " bytes in " + downloadDir);
+            System.out.println("🔄 RESUMING from " + alreadyDownloaded + " bytes");
         } else {
             new File(downloadDir).mkdirs();
         }
@@ -48,34 +48,23 @@ public class DownloadManager {
         sources.removeIf(c -> c.getPort() == myPort);
 
         if (sources.isEmpty()) {
-            System.out.println(" No source found for: " + filename);
+            System.out.println("No source found");
             return;
         }
 
-        System.out.println("Found " + sources.size() + " sources:");
+        System.out.println("Using " + sources.size() + " sources in parallel (round-robin - no speed measurement)");
         sources.forEach(c -> System.out.println("  → " + c));
 
         currentSources = new CopyOnWriteArrayList<>(sources);
 
         ScheduledExecutorService refresher = Executors.newSingleThreadScheduledExecutor();
-        refresher.scheduleAtFixedRate(() -> refreshSources(directory, filename, myPort),
-                5, 5, TimeUnit.SECONDS);
+        refresher.scheduleAtFixedRate(() -> refreshSources(directory, filename, myPort), 5, 5, TimeUnit.SECONDS);
 
-        ClientInfo first = sources.get(0);
-        try (Socket socket = new Socket(first.getHost(), first.getPort());
-             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-             DataInputStream in = new DataInputStream(socket.getInputStream())) {
-
-            out.writeUTF("SIZE");
-            out.writeUTF(filename);
-            fileSize = in.readLong();
-        }
-        System.out.println(" File size: " + fileSize + " bytes");
+        fileSize = getFileSize(sources.get(0), filename);
+        System.out.println("File size: " + fileSize + " bytes");
 
         if (alreadyDownloaded >= fileSize) {
-            if (partFile.renameTo(finalFile)) {
-                System.out.println(" File was already complete (renamed)");
-            }
+            partFile.renameTo(finalFile);
             refresher.shutdownNow();
             return;
         }
@@ -88,15 +77,21 @@ public class DownloadManager {
         long remaining = fileSize - alreadyDownloaded;
         long chunkSize = remaining / THREADS;
 
+        // ROUND-ROBIN THUẦN – TẤT CẢ NGUỒN ĐỀU ĐƯỢC DÙNG
         for (int i = 0; i < THREADS; i++) {
             long chunkStart = alreadyDownloaded + (i * chunkSize);
-            long chunkLength = (i == THREADS - 1)
-                    ? fileSize - chunkStart
-                    : chunkSize;
+            long chunkLength = (i == THREADS - 1) ? fileSize - chunkStart : chunkSize;
 
-            pool.submit(() -> downloadChunk(filename, chunkStart, chunkLength, output, directory));
+            ClientInfo assignedSource = sources.get(i % sources.size());
+
+            final long fStart = chunkStart;
+            final long fLength = chunkLength;
+            final ClientInfo fSource = assignedSource;
+
+            pool.submit(() -> downloadChunkWithFixedSource(filename, fStart, fLength, output, directory, fSource));
         }
 
+        // Progress bar
         Thread progressThread = new Thread(() -> {
             try {
                 while (!pool.isTerminated()) {
@@ -121,14 +116,23 @@ public class DownloadManager {
         String md5 = computeMD5(partFilePath);
         long endTime = System.currentTimeMillis();
 
-        System.out.println("\n Download complete!");
+        System.out.println("\n✅ Download complete!");
         System.out.println("   MD5: " + md5);
         System.out.println("   Time: " + (endTime - startTime) + " ms");
 
-        if (partFile.renameTo(finalFile)) {
-            System.out.println(" Saved to: " + finalFilePath);
-        } else {
-            System.out.println(" Cannot rename .part file to final file");
+        partFile.renameTo(finalFile);
+        System.out.println("📁 Saved to: " + finalFilePath);
+    }
+
+    // ==================== CÁC HÀM HỖ TRỢ ====================
+
+    private static long getFileSize(ClientInfo source, String filename) throws Exception {
+        try (Socket s = new Socket(source.getHost(), source.getPort());
+             DataOutputStream out = new DataOutputStream(s.getOutputStream());
+             DataInputStream in = new DataInputStream(s.getInputStream())) {
+            out.writeUTF("SIZE");
+            out.writeUTF(filename);
+            return in.readLong();
         }
     }
 
@@ -141,57 +145,54 @@ public class DownloadManager {
         } catch (Exception ignored) {}
     }
 
-    private static void downloadChunk(String filename,
-                                      long chunkStart,
-                                      long chunkLength,
-                                      RandomAccessFile output,
-                                      DirectoryInterface directory) {
+    private static void downloadChunkWithFixedSource(String filename,
+                                                     long chunkStart,
+                                                     long chunkLength,
+                                                     RandomAccessFile output,
+                                                     DirectoryInterface directory,
+                                                     ClientInfo fixedSource) {
 
         long downloaded = 0;
+        ClientInfo currentSource = fixedSource;
 
         while (downloaded < chunkLength) {
-            for (ClientInfo source : currentSources) {
-                try {
-                    directory.incrementLoad(source);
+            try {
+                directory.incrementLoad(currentSource);
 
-                    Socket socket = new Socket(source.getHost(), source.getPort());
-                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                    out.writeUTF("GET");
-                    out.writeUTF(filename);
-                    out.writeLong(chunkStart + downloaded);
-                    out.writeLong(chunkLength - downloaded);
+                Socket socket = new Socket(currentSource.getHost(), currentSource.getPort());
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                out.writeUTF("GET");
+                out.writeUTF(filename);
+                out.writeLong(chunkStart + downloaded);
+                out.writeLong(chunkLength - downloaded);
 
-                    InputStream rawIn = socket.getInputStream();
-                    InputStream dataIn = USE_COMPRESSION ? new GZIPInputStream(rawIn) : rawIn;
+                InputStream rawIn = socket.getInputStream();
+                InputStream dataIn = USE_COMPRESSION ? new GZIPInputStream(rawIn) : rawIn;
 
-                    byte[] buffer = new byte[65536];
-                    int read;
-                    long remaining = chunkLength - downloaded;
+                byte[] buffer = new byte[65536];
+                long remaining = chunkLength - downloaded;
+                int read;
 
-                    while (remaining > 0 && (read = dataIn.read(buffer, 0, (int) Math.min(buffer.length, remaining))) > 0) {
-                        synchronized (output) {
-                            output.seek(chunkStart + downloaded);
-                            output.write(buffer, 0, read);
-                        }
-                        downloaded += read;
-                        totalDownloaded.addAndGet(read);
-                        remaining -= read;
+                while (remaining > 0 && (read = dataIn.read(buffer, 0, (int) Math.min(buffer.length, remaining))) > 0) {
+                    synchronized (output) {
+                        output.seek(chunkStart + downloaded);
+                        output.write(buffer, 0, read);
                     }
-
-                    socket.close();
-                    directory.decrementLoad(source);
-
-                    if (downloaded >= chunkLength) return;
-
-                } catch (Exception e) {
-                    try { directory.decrementLoad(source); } catch (Exception ignored) {}
+                    downloaded += read;
+                    totalDownloaded.addAndGet(read);
+                    remaining -= read;
                 }
-            }
 
-            System.out.println("All sources failed for remaining chunk, retrying in 2s...");
-            try { Thread.sleep(2000); } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
+                socket.close();
+                directory.decrementLoad(currentSource);
                 return;
+
+            } catch (Exception e) {
+                try { directory.decrementLoad(currentSource); } catch (Exception ignored) {}
+                System.out.println("⚠️ Source " + currentSource.getPort() + " failed → switching");
+
+                int idx = currentSources.indexOf(currentSource);
+                currentSource = currentSources.get((idx + 1) % currentSources.size());
             }
         }
     }
