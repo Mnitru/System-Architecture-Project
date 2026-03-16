@@ -4,21 +4,12 @@ import java.io.*;
 import java.net.Socket;
 import java.util.zip.GZIPOutputStream;
 
-/**
- * FileServer - Xử lý yêu cầu TCP từ DownloadManager
- * - Hỗ trợ lệnh SIZE và GET
- * - Hỗ trợ GZIP compression
- * - Hỗ trợ giới hạn tốc độ (throttle) theo yêu cầu của Daemon
- */
 public class FileServer implements Runnable {
 
     private final Socket socket;
-    private final int speedLimitKbps;                  // ← THÊM MỚI
+    private final int speedLimitKbps;                
     private static final boolean USE_COMPRESSION = true;
 
-    /**
-     * Constructor mới nhận thêm tốc độ giới hạn
-     */
     public FileServer(Socket socket, int speedLimitKbps) {
         this.socket = socket;
         this.speedLimitKbps = speedLimitKbps;
@@ -31,7 +22,6 @@ public class FileServer implements Runnable {
 
             String cmd = in.readUTF();
 
-            // ==================== LỆNH SIZE ====================
             if (cmd.equals("SIZE")) {
                 String filename = in.readUTF();
                 File file = new File(Daemon.SHARED_DIR + "/" + filename);
@@ -39,13 +29,12 @@ public class FileServer implements Runnable {
                 long size = file.exists() ? file.length() : 0;
                 cmdOut.writeLong(size);
 
-                System.out.println("📏 SIZE request: " + filename + " → " + size + " bytes");
+                System.out.println(" SIZE request: " + filename + " → " + size + " bytes");
 
                 socket.close();
                 return;
             }
 
-            // ==================== LỆNH GET ====================
             if (cmd.equals("GET")) {
                 String filename = in.readUTF();
                 long start = in.readLong();
@@ -53,7 +42,7 @@ public class FileServer implements Runnable {
 
                 File file = new File(Daemon.SHARED_DIR + "/" + filename);
                 if (!file.exists()) {
-                    System.out.println("❌ File not found: " + filename);
+                    System.out.println(" File not found: " + filename);
                     socket.close();
                     return;
                 }
@@ -66,11 +55,11 @@ public class FileServer implements Runnable {
                             ? new GZIPOutputStream(rawOut)
                             : rawOut;
 
-                    System.out.println("📤 Sending chunk: " + filename +
+                    System.out.println(" Sending chunk: " + filename +
                             " | offset=" + start +
                             " | length=" + length +
                             (USE_COMPRESSION ? " (GZIP)" : "") +
-                            (speedLimitKbps > 0 ? " | Speed limit: " + speedLimitKbps + " Kbps" : ""));
+                            (speedLimitKbps > 0 ? " Speed limit: " + speedLimitKbps + " Kbps" : ""));
 
                     byte[] buffer = new byte[65536];
                     long remaining = length;
@@ -83,7 +72,6 @@ public class FileServer implements Runnable {
                         dataOut.write(buffer, 0, read);
                         dataOut.flush();
 
-                        // ==================== THROTTLE TỐC ĐỘ ====================
                         if (speedLimitKbps > 0) {
                             long bitsSent = (long) read * 8;
                             long expectedMs = (bitsSent * 1000L) / (speedLimitKbps * 1024L);
@@ -101,11 +89,11 @@ public class FileServer implements Runnable {
                     dataOut.flush();
                 }
 
-                System.out.println("✅ Chunk sent successfully");
+                System.out.println("Chunk sent successfully");
             }
 
         } catch (Exception e) {
-            System.out.println("⚠️ FileServer error: " + e.getMessage());
+            System.out.println(" FileServer error: " + e.getMessage());
         } finally {
             try {
                 if (!socket.isClosed()) socket.close();

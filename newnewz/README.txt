@@ -61,7 +61,7 @@ cd src
 javac -d . directory/*.java model/*.java daemon/*.java
 ###2. Start Directory Server (only one instance)
 java directory.Directory
-###3. Start Daemons (open multiple terminals)(0,3000,8000,10000 are speed(mb/s))
+###3. Start Daemons (open multiple terminals)(0,3000,8000,10000 are speed(kbps))
 java daemon.Daemon 5000 0
 java daemon.Daemon 5001 3000 
 java daemon.Daemon 5002 8000
