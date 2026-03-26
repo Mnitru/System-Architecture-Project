@@ -3,236 +3,311 @@ package daemon;
 import directory.DirectoryInterface;
 import model.ClientInfo;
 
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.FileInputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.GZIPInputStream;
 
 public class DownloadManager {
 
+    private static final int MAX_WORKERS = 16;
+    private static final int BUFFER_SIZE = 64 * 1024;
+    private static final long CHUNK_SIZE = 1L * 1024 * 1024; // 1 MB
+    private static final boolean USE_COMPRESSION = true;
+
     private static List<ClientInfo> currentSources;
     private static AtomicLong totalDownloaded;
     private static long fileSize;
-    private static final boolean USE_COMPRESSION = false; 
-
-    private static final Map<ClientInfo, AtomicLong> bytesPerSource = new ConcurrentHashMap<>();
-    private static final Map<ClientInfo, Long> lastBytes = new ConcurrentHashMap<>();
-    private static final Map<ClientInfo, Long> lastTime = new ConcurrentHashMap<>();
 
     public static void download(String filename,
-                                DirectoryInterface directory,
-                                int myPort,
-                                String downloadDir) throws Exception {
+            DirectoryInterface directory,
+            int myPort,
+            String downloadDir) throws Exception {
 
         long startTime = System.currentTimeMillis();
 
-        String partFilePath = downloadDir + "/" + filename + ".part";
-        String finalFilePath = downloadDir + "/" + filename;
+        Path downloadPath = Path.of(downloadDir);
+        Files.createDirectories(downloadPath);
 
-        File partFile = new File(partFilePath);
-        File finalFile = new File(finalFilePath);
+        Path partPath = downloadPath.resolve(filename + ".part");
+        Path finalPath = downloadPath.resolve(filename);
+        Path metaPath = downloadPath.resolve(filename + ".meta");
 
-        if (finalFile.exists()) {
-            System.out.println(" File already completed: " + finalFilePath);
+        if (Files.exists(finalPath)) {
+            System.out.println("File already completed: " + finalPath);
             return;
-        }
-
-        long alreadyDownloaded = partFile.exists() ? partFile.length() : 0;
-        if (alreadyDownloaded > 0) {
-            System.out.println(" RESUMING from " + formatBytes(alreadyDownloaded) + " in " + downloadDir);
-        } else {
-            new File(downloadDir).mkdirs();
         }
 
         List<ClientInfo> sources = directory.getSourcesSortedByLoad(filename);
         sources.removeIf(c -> c.getPort() == myPort);
 
         if (sources.isEmpty()) {
-            System.out.println(" No source found");
+            System.out.println("No source found for: " + filename);
             return;
-        }
-
-        int numSources = sources.size();
-        int totalThreads = numSources * 2;  
-
-        System.out.println("🚀 Using " + numSources + " sources with " + totalThreads + " threads");
-        sources.forEach(c -> System.out.println("  → " + c));
-
-        for (ClientInfo s : sources) {
-            bytesPerSource.put(s, new AtomicLong(0));
-            lastBytes.put(s, 0L);
-            lastTime.put(s, System.currentTimeMillis());
         }
 
         currentSources = new CopyOnWriteArrayList<>(sources);
 
         ScheduledExecutorService refresher = Executors.newSingleThreadScheduledExecutor();
-        refresher.scheduleAtFixedRate(() -> refreshSources(directory, filename, myPort), 5, 5, TimeUnit.SECONDS);
+        refresher.scheduleAtFixedRate(
+                () -> refreshSources(directory, filename, myPort),
+                5,
+                5,
+                TimeUnit.SECONDS);
 
         fileSize = getFileSize(sources.get(0), filename);
-        System.out.println(" File size: " + formatBytes(fileSize));
+        System.out.println("Found " + currentSources.size() + " sources:");
+        currentSources.forEach(c -> System.out.println("  -> " + c));
+        System.out.println("File size: " + fileSize + " bytes");
 
-        if (alreadyDownloaded >= fileSize) {
-            partFile.renameTo(finalFile);
+        if (!Files.exists(partPath)) {
+            Files.createFile(partPath);
+        }
+
+        try (FileChannel channel = FileChannel.open(
+                partPath,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+            channel.truncate(fileSize);
+
+            DownloadState state = loadOrCreateState(metaPath, fileSize);
+            totalDownloaded = new AtomicLong(state.completedBytes(fileSize));
+
+            if (state.isComplete()) {
+                finalizeDownload(partPath, finalPath, metaPath, startTime);
+                refresher.shutdownNow();
+                return;
+            }
+
+            BlockingQueue<ChunkTask> queue = new LinkedBlockingQueue<>();
+            AtomicInteger remainingChunks = new AtomicInteger(0);
+            enqueueMissingChunks(state, queue, remainingChunks, fileSize);
+
+            if (remainingChunks.get() == 0) {
+                finalizeDownload(partPath, finalPath, metaPath, startTime);
+                refresher.shutdownNow();
+                return;
+            }
+
+            int workerCount = Math.min(Math.min(MAX_WORKERS, currentSources.size()), remainingChunks.get());
+            workerCount = Math.max(workerCount, 1);
+
+            System.out.println("Starting parallel download with " + workerCount + " active source workers");
+
+            AtomicBoolean stopSignal = new AtomicBoolean(false);
+            ExecutorService pool = Executors.newFixedThreadPool(workerCount);
+
+            for (int i = 0; i < workerCount; i++) {
+                ClientInfo source = currentSources.get(i % currentSources.size());
+                pool.submit(() -> downloadFromSourceWorker(
+                        filename,
+                        source,
+                        channel,
+                        directory,
+                        queue,
+                        state,
+                        metaPath,
+                        remainingChunks,
+                        stopSignal));
+            }
+
+            Thread progressThread = new Thread(() -> printProgress(stopSignal, remainingChunks));
+            progressThread.start();
+
+            pool.shutdown();
+            boolean finished = pool.awaitTermination(2, TimeUnit.HOURS);
+            stopSignal.set(true);
+            progressThread.interrupt();
             refresher.shutdownNow();
-            return;
+
+            if (!finished || remainingChunks.get() > 0 || !state.isComplete()) {
+                throw new IOException(
+                        "Download did not finish successfully. Remaining chunks: " + remainingChunks.get());
+            }
+
+            finalizeDownload(partPath, finalPath, metaPath, startTime);
         }
+    }
 
-        RandomAccessFile output = new RandomAccessFile(partFile, "rw");
-        totalDownloaded = new AtomicLong(alreadyDownloaded);
+    private static void downloadFromSourceWorker(String filename,
+            ClientInfo initialSource,
+            FileChannel channel,
+            DirectoryInterface directory,
+            BlockingQueue<ChunkTask> queue,
+            DownloadState state,
+            Path metaPath,
+            AtomicInteger remainingChunks,
+            AtomicBoolean stopSignal) {
 
-        System.out.println(" Measuring real download speed of all sources (5MB sample × 2)...");
-        double[] speedsKbps = measureSpeeds(sources, filename);
-        double totalSpeed = Arrays.stream(speedsKbps).sum();
+        ClientInfo currentSource = initialSource;
 
-        System.out.printf("Total estimated speed: %.1f Kbps%n", totalSpeed);
-        for (int i = 0; i < sources.size(); i++) {
-            System.out.printf("  → %s : %.1f Kbps%n", sources.get(i), speedsKbps[i]);
-        }
+        while (!stopSignal.get()) {
+            ChunkTask task;
+            try {
+                task = queue.poll(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
 
-        ExecutorService pool = Executors.newFixedThreadPool(totalThreads);
+            if (task == null) {
+                if (remainingChunks.get() == 0) {
+                    return;
+                }
+                currentSource = pickAnotherSource(currentSource);
+                continue;
+            }
 
-        long remaining = fileSize - alreadyDownloaded;
-        long currentStart = alreadyDownloaded;
+            if (state.isChunkDone(task.index)) {
+                continue;
+            }
 
-        for (int i = 0; i < numSources; i++) {
-            double ratio = (totalSpeed > 0) ? speedsKbps[i] / totalSpeed : 1.0 / numSources;
-            long bytesForThisSource = (long) (remaining * ratio);
-            bytesForThisSource = Math.max(2 * 1024 * 1024, Math.min(bytesForThisSource, remaining));
+            boolean done = false;
+            List<ClientInfo> snapshot = new ArrayList<>(currentSources);
+            if (!snapshot.contains(currentSource) && !snapshot.isEmpty()) {
+                currentSource = snapshot.get(0);
+            }
 
-            long subChunkSize = bytesForThisSource / 2;
-            for (int sub = 0; sub < 2; sub++) {
-                long thisLen = (sub == 1) ? bytesForThisSource - subChunkSize : subChunkSize;
+            int attempts = 0;
+            int maxAttempts = Math.max(1, snapshot.size());
 
-                if (thisLen <= 0) continue;
-                if (currentStart + thisLen > fileSize) thisLen = fileSize - currentStart;
+            while (!done && attempts < maxAttempts && !stopSignal.get()) {
+                if (currentSource == null) {
+                    break;
+                }
+                done = tryDownloadChunk(filename, task, currentSource, channel, directory);
+                if (!done) {
+                    attempts++;
+                    currentSource = pickNextSource(snapshot, currentSource);
+                }
+            }
 
-                final long fStart = currentStart;
-                final long fLength = thisLen;
-                final ClientInfo fSource = sources.get(i);
-
-                pool.submit(() -> downloadChunkWithFixedSource(
-                        filename, fStart, fLength, output, directory, fSource));
-
-                currentStart += thisLen;
+            if (done) {
+                if (state.markChunkDone(task.index)) {
+                    totalDownloaded.addAndGet(task.length);
+                    remainingChunks.decrementAndGet();
+                    persistState(metaPath, state);
+                }
+            } else {
+                queue.offer(task);
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
         }
-
-        if (currentStart < fileSize) {
-            final long fStart = currentStart;
-            final long fLength = fileSize - currentStart;
-            final ClientInfo fallback = sources.get(0);
-            pool.submit(() -> downloadChunkWithFixedSource(
-                    filename, fStart, fLength, output, directory, fallback));
-        }
-
-        Thread progressThread = new Thread(() -> {
-            long lastTotalBytes = totalDownloaded.get();
-            long lastTotalTime = System.currentTimeMillis();
-
-            try {
-                while (!pool.isTerminated()) {
-                    long done = totalDownloaded.get();
-                    int percent = fileSize > 0 ? (int) (done * 100L / fileSize) : 0;
-                    long now = System.currentTimeMillis();
-
-                    long deltaTotal = done - lastTotalBytes;
-                    long deltaTTotal = now - lastTotalTime;
-                    long totalSpeedKBps = (deltaTTotal > 0) ? deltaTotal * 1000 / deltaTTotal / 1024 : 0;
-
-                    StringBuilder speedStr = new StringBuilder();
-                    for (ClientInfo s : currentSources) {
-                        long curr = bytesPerSource.getOrDefault(s, new AtomicLong(0)).get();
-                        long prev = lastBytes.getOrDefault(s, 0L);
-                        long dt = now - lastTime.getOrDefault(s, now);
-                        long srcSpeedKBps = (dt > 0) ? (curr - prev) * 1000 / dt / 1024 : 0;
-                        speedStr.append(s.getPort()).append(":").append(srcSpeedKBps).append("KB/s ");
-                        lastBytes.put(s, curr);
-                        lastTime.put(s, now);
-                    }
-
-                    System.out.printf("\r[Progress] %3d%% | %10d / %10d | Total: %4d KB/s | %s",
-                            percent, done, fileSize, totalSpeedKBps, speedStr);
-
-                    lastTotalBytes = done;
-                    lastTotalTime = now;
-
-                    Thread.sleep(500);
-                }
-            } catch (InterruptedException ignored) {}
-            System.out.println();
-        });
-        progressThread.start();
-
-        pool.shutdown();
-        pool.awaitTermination(2, TimeUnit.HOURS);
-
-        progressThread.interrupt();
-        refresher.shutdownNow();
-        output.close();
-
-        String md5 = computeMD5(partFilePath);
-        long endTime = System.currentTimeMillis();
-
-        System.out.println("\n Download complete!");
-        System.out.println("   MD5: " + md5);
-        System.out.println("   Time: " + (endTime - startTime) + " ms");
-
-        if (partFile.renameTo(finalFile)) {
-            System.out.println(" Saved to: " + finalFilePath);
-        }
     }
 
-    private static double[] measureSpeeds(List<ClientInfo> sources, String filename) throws Exception {
-        double[] speeds = new double[sources.size()];
-        for (int i = 0; i < sources.size(); i++) {
-            speeds[i] = measureSingleSpeed(sources.get(i), filename);
-        }
-        return speeds;
-    }
-
-    private static double measureSingleSpeed(ClientInfo source, String filename) throws Exception {
-        long testSize = 5 * 1024 * 1024; 
-        double totalBps = 0;
-        int trials = 2;
-
-        for (int t = 0; t < trials; t++) {
-            long start = System.currentTimeMillis();
-            long bytes = 0;
+    private static boolean tryDownloadChunk(String filename,
+            ChunkTask task,
+            ClientInfo source,
+            FileChannel channel,
+            DirectoryInterface directory) {
+        try {
+            directory.incrementLoad(source);
 
             try (Socket socket = new Socket(source.getHost(), source.getPort());
-                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                 InputStream in = socket.getInputStream()) {
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
 
                 out.writeUTF("GET");
                 out.writeUTF(filename);
-                out.writeLong(0);
-                out.writeLong(testSize);
+                out.writeLong(task.start);
+                out.writeLong(task.length);
+                out.flush();
 
-                byte[] buf = new byte[131072];
-                int r;
-                while (bytes < testSize && (r = in.read(buf)) > 0) {
-                    bytes += r;
+                InputStream rawIn = socket.getInputStream();
+                InputStream dataIn = USE_COMPRESSION ? new GZIPInputStream(rawIn) : rawIn;
+
+                byte[] buffer = new byte[BUFFER_SIZE];
+                long position = task.start;
+                long remaining = task.length;
+
+                while (remaining > 0) {
+                    int read = dataIn.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (read < 0) {
+                        throw new EOFException("Unexpected end of stream from source " + source);
+                    }
+
+                    ByteBuffer byteBuffer = ByteBuffer.wrap(buffer, 0, read);
+                    while (byteBuffer.hasRemaining()) {
+                        channel.write(byteBuffer, position);
+                    }
+                    position += read;
+                    remaining -= read;
+                }
+            } finally {
+                try {
+                    directory.decrementLoad(source);
+                } catch (Exception ignored) {
                 }
             }
 
-            long ms = System.currentTimeMillis() - start;
-            double bps = (ms > 0) ? (bytes * 1000.0) / ms : 0;
-            totalBps += bps;
+            return true;
+        } catch (Exception e) {
+            try {
+                directory.decrementLoad(source);
+            } catch (Exception ignored) {
+            }
+            System.out.println("Source " + source.getPort() + " failed for chunk " + task.index + ", switching...");
+            return false;
         }
+    }
 
-        return (totalBps / trials) / 1024; 
+    private static void printProgress(AtomicBoolean stopSignal, AtomicInteger remainingChunks) {
+        try {
+            while (!stopSignal.get()) {
+                long done = totalDownloaded.get();
+                int percent = (int) Math.min(100, (done * 100) / Math.max(fileSize, 1));
+                System.out.printf(
+                        "\r[Progress] %3d%% | %10d / %10d bytes | Sources: %2d | Remaining chunks: %4d ",
+                        percent,
+                        done,
+                        fileSize,
+                        currentSources.size(),
+                        remainingChunks.get());
+                Thread.sleep(500);
+            }
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        System.out.println();
     }
 
     private static long getFileSize(ClientInfo source, String filename) throws Exception {
-        try (Socket s = new Socket(source.getHost(), source.getPort());
-             DataOutputStream out = new DataOutputStream(s.getOutputStream());
-             DataInputStream in = new DataInputStream(s.getInputStream())) {
+        try (Socket socket = new Socket(source.getHost(), source.getPort());
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                DataInputStream in = new DataInputStream(socket.getInputStream())) {
             out.writeUTF("SIZE");
             out.writeUTF(filename);
+            out.flush();
             return in.readLong();
         }
     }
@@ -243,64 +318,102 @@ public class DownloadManager {
             newList.removeIf(c -> c.getPort() == myPort);
             currentSources.clear();
             currentSources.addAll(newList);
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
     }
 
-    private static void downloadChunkWithFixedSource(String filename,
-                                                     long chunkStart,
-                                                     long chunkLength,
-                                                     RandomAccessFile output,
-                                                     DirectoryInterface directory,
-                                                     ClientInfo fixedSource) {
+    private static ClientInfo pickAnotherSource(ClientInfo currentSource) {
+        List<ClientInfo> snapshot = new ArrayList<>(currentSources);
+        return pickNextSource(snapshot, currentSource);
+    }
 
-        long downloaded = 0;
-        ClientInfo current = fixedSource;
+    private static ClientInfo pickNextSource(List<ClientInfo> snapshot, ClientInfo currentSource) {
+        if (snapshot.isEmpty()) {
+            return null;
+        }
+        int currentIndex = snapshot.indexOf(currentSource);
+        if (currentIndex < 0) {
+            return snapshot.get(0);
+        }
+        return snapshot.get((currentIndex + 1) % snapshot.size());
+    }
 
-        while (downloaded < chunkLength) {
-            try {
-                directory.incrementLoad(current);
-
-                Socket socket = new Socket(current.getHost(), current.getPort());
-                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                out.writeUTF("GET");
-                out.writeUTF(filename);
-                out.writeLong(chunkStart + downloaded);
-                out.writeLong(chunkLength - downloaded);
-
-                InputStream rawIn = socket.getInputStream();
-                InputStream dataIn = USE_COMPRESSION ? new GZIPInputStream(rawIn) : rawIn;
-
-                byte[] buffer = new byte[131072];
-                long remaining = chunkLength - downloaded;
-                int read;
-
-                while (remaining > 0 && (read = dataIn.read(buffer, 0, (int) Math.min(buffer.length, remaining))) > 0) {
-                    synchronized (output) {
-                        output.seek(chunkStart + downloaded);
-                        output.write(buffer, 0, read);
-                    }
-                    downloaded += read;
-                    totalDownloaded.addAndGet(read);
-                    bytesPerSource.get(current).addAndGet(read);
-                    remaining -= read;
-                }
-
-                socket.close();
-                directory.decrementLoad(current);
-                return;
-
-            } catch (Exception e) {
-                try { directory.decrementLoad(current); } catch (Exception ignored) {}
-                System.out.println(" Source " + current.getPort() + " failed → switching");
-
-                int idx = currentSources.indexOf(current);
-                if (idx != -1 && !currentSources.isEmpty()) {
-                    current = currentSources.get((idx + 1) % currentSources.size());
-                } else {
-                    return; 
-                }
+    private static void enqueueMissingChunks(DownloadState state,
+            BlockingQueue<ChunkTask> queue,
+            AtomicInteger remainingChunks,
+            long totalSize) {
+        long chunkCount = state.chunkCount();
+        for (int i = 0; i < chunkCount; i++) {
+            if (!state.isChunkDone(i)) {
+                long start = i * CHUNK_SIZE;
+                long length = Math.min(CHUNK_SIZE, totalSize - start);
+                queue.offer(new ChunkTask(i, start, length));
+                remainingChunks.incrementAndGet();
             }
         }
+    }
+
+    private static DownloadState loadOrCreateState(Path metaPath, long totalSize) throws IOException {
+        int chunkCount = (int) ((totalSize + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        DownloadState emptyState = new DownloadState(chunkCount);
+
+        if (!Files.exists(metaPath)) {
+            persistState(metaPath, emptyState);
+            return emptyState;
+        }
+
+        try (BufferedReader reader = Files.newBufferedReader(metaPath)) {
+            String line = reader.readLine();
+            if (line == null || line.isBlank()) {
+                return emptyState;
+            }
+            String[] parts = line.split(":", 2);
+            if (parts.length != 2) {
+                return emptyState;
+            }
+            int storedChunkCount = Integer.parseInt(parts[0]);
+            if (storedChunkCount != chunkCount) {
+                return emptyState;
+            }
+            BitSet bitSet = new BitSet(chunkCount);
+            String bitmap = parts[1].trim();
+            for (int i = 0; i < Math.min(bitmap.length(), chunkCount); i++) {
+                if (bitmap.charAt(i) == '1') {
+                    bitSet.set(i);
+                }
+            }
+            return new DownloadState(chunkCount, bitSet);
+        } catch (Exception e) {
+            return emptyState;
+        }
+    }
+
+    private static synchronized void persistState(Path metaPath, DownloadState state) {
+        try (BufferedWriter writer = Files.newBufferedWriter(
+                metaPath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE)) {
+            writer.write(state.chunkCount() + ":" + state.toBitmapString());
+            writer.newLine();
+        } catch (IOException e) {
+            throw new RuntimeException("Cannot persist download metadata", e);
+        }
+    }
+
+    private static void finalizeDownload(Path partPath,
+            Path finalPath,
+            Path metaPath,
+            long startTime) throws Exception {
+        String md5 = computeMD5(partPath.toString());
+        Files.move(partPath, finalPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        Files.deleteIfExists(metaPath);
+
+        long endTime = System.currentTimeMillis();
+        System.out.println("\nDownload complete!");
+        System.out.println("  MD5: " + md5);
+        System.out.println("  Time: " + (endTime - startTime) + " ms");
+        System.out.println("  Saved to: " + finalPath);
     }
 
     private static String computeMD5(String filePath) throws Exception {
@@ -320,10 +433,66 @@ public class DownloadManager {
         return sb.toString();
     }
 
-    private static String formatBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        int exp = (int) (Math.log(bytes) / Math.log(1024));
-        String pre = "KMGTPE".charAt(exp - 1) + "";
-        return String.format("%.1f %sB", bytes / Math.pow(1024, exp), pre);
+    private static final class ChunkTask {
+        private final int index;
+        private final long start;
+        private final long length;
+
+        private ChunkTask(int index, long start, long length) {
+            this.index = index;
+            this.start = start;
+            this.length = length;
+        }
+    }
+
+    private static final class DownloadState {
+        private final int chunkCount;
+        private final BitSet completed;
+
+        private DownloadState(int chunkCount) {
+            this(chunkCount, new BitSet(chunkCount));
+        }
+
+        private DownloadState(int chunkCount, BitSet completed) {
+            this.chunkCount = chunkCount;
+            this.completed = completed;
+        }
+
+        private synchronized boolean isChunkDone(int index) {
+            return completed.get(index);
+        }
+
+        private synchronized boolean markChunkDone(int index) {
+            if (completed.get(index)) {
+                return false;
+            }
+            completed.set(index);
+            return true;
+        }
+
+        private synchronized boolean isComplete() {
+            return completed.cardinality() == chunkCount;
+        }
+
+        private synchronized long completedBytes(long totalSize) {
+            long done = 0;
+            for (int i = completed.nextSetBit(0); i >= 0; i = completed.nextSetBit(i + 1)) {
+                long start = i * CHUNK_SIZE;
+                done += Math.min(CHUNK_SIZE, totalSize - start);
+            }
+            return done;
+        }
+
+        private int chunkCount() {
+            return chunkCount;
+        }
+
+        private synchronized String toBitmapString() {
+            StringBuilder sb = new StringBuilder(chunkCount);
+            for (int i = 0; i < chunkCount; i++) {
+                sb.append(completed.get(i) ? '1' : '0');
+            }
+            return sb.toString();
+        }
     }
 }
